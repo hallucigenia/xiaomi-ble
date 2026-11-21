@@ -10,6 +10,8 @@ import datetime
 import logging
 import math
 import struct
+from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from bleak import BleakClient
@@ -23,6 +25,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESCCM
 from home_assistant_bluetooth import BluetoothServiceInfo
 from sensor_state_data import (
     BinarySensorDeviceClass,
+    DeviceKey,
+    SensorDeviceClass,
     SensorLibrary,
     SensorUpdate,
     Units,
@@ -43,11 +47,23 @@ from .devices import (
     DEVICE_TYPES,
     SCALE_MODELS_WITH_STABILIZED,
     SLEEPY_DEVICE_MODELS,
+    DeviceEntry,
 )
 from .events import EventDeviceKeys
 from .locks import BLE_LOCK_ACTION, BLE_LOCK_ERROR, BLE_LOCK_METHOD
+from .mibeacon import MiBeaconStateOrder, standard_mibeacon_frame_counter
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class _MiBeaconFrame:
+    """Scope ordering and state changes to one authenticated frame."""
+
+    counter: int
+    supplemental: bool = False
+    seed: bool = False
+    fields: set[tuple[str, DeviceKey]] = field(default_factory=set)
 
 
 def to_mac(addr: bytes) -> str:
@@ -2088,9 +2104,16 @@ def decode_temps_probes(packet_value: int) -> float:
 class XiaomiBluetoothDeviceData(BluetoothData):
     """Data for Xiaomi BLE sensors."""
 
-    def __init__(self, bindkey: bytes | None = None) -> None:
+    def __init__(
+        self,
+        bindkey: bytes | None = None,
+        *,
+        mibeacon_order: MiBeaconStateOrder | None = None,
+    ) -> None:
         super().__init__()
         self.set_bindkey(bindkey)
+        self.mibeacon_order = mibeacon_order
+        self._mibeacon_frame: _MiBeaconFrame | None = None
 
         # Data that we know how to parse but don't yet map to the SensorData model.
         self.unhandled: dict[str, Any] = {}
@@ -2124,6 +2147,7 @@ class XiaomiBluetoothDeviceData(BluetoothData):
 
     def set_bindkey(self, bindkey: bytes | None) -> None:
         """Set the bindkey."""
+        self.cipher: AESCCM | None = None
         if bindkey:
             if len(bindkey) == 12:
                 # MiBeacon v2/v3 bindkey (requires 4 additional (fixed) bytes)
@@ -2131,10 +2155,109 @@ class XiaomiBluetoothDeviceData(BluetoothData):
                     [bindkey[0:6], bytes.fromhex("8d3d3c97"), bindkey[6:]]
                 )
             elif len(bindkey) == 16:
-                self.cipher: AESCCM | None = AESCCM(bindkey, tag_length=4)
-        else:
-            self.cipher = None
+                self.cipher = AESCCM(bindkey, tag_length=4)
         self.bindkey = bindkey
+
+    def update_mibeacon(
+        self, address: str, packet: bytes, *, seed: bool = False
+    ) -> SensorUpdate | None:
+        """Decode fresh state from a supplemental authenticated MiBeacon frame.
+
+        A cached frame can seed field order without publishing or storing its values.
+        Supplemental frames do not supply RSSI or events.
+        """
+        if (
+            self.mibeacon_order is None
+            or (counter := standard_mibeacon_frame_counter(packet)) is None
+        ):
+            return None
+
+        frame = _MiBeaconFrame(counter, supplemental=True, seed=seed)
+        if (
+            not self._parse_xiaomi(address, packet, frame=frame)
+            or seed
+            or not frame.fields
+        ):
+            return None
+
+        update = self._finish_update()
+        sensors = [key for kind, key in frame.fields if kind == "sensor"]
+        binaries = [key for kind, key in frame.fields if kind == "binary_sensor"]
+        return SensorUpdate(
+            title=update.title,
+            devices=update.devices,
+            entity_descriptions={
+                key: update.entity_descriptions[key] for key in sensors
+            },
+            entity_values={key: update.entity_values[key] for key in sensors},
+            binary_entity_descriptions={
+                key: update.binary_entity_descriptions[key] for key in binaries
+            },
+            binary_entity_values={
+                key: update.binary_entity_values[key] for key in binaries
+            },
+        )
+
+    def _accept_mibeacon_field(
+        self, kind: str, key: str, device_id: str | None
+    ) -> bool:
+        if (frame := self._mibeacon_frame) is None or self.mibeacon_order is None:
+            return True
+        field = (kind, DeviceKey(key, device_id))
+        # The last occurrence of a field within one object payload still wins.
+        if field not in frame.fields:
+            if not self.mibeacon_order.accept(field, frame.counter):
+                return False
+            frame.fields.add(field)
+        return not frame.seed
+
+    def update_sensor(
+        self,
+        key: str,
+        native_unit_of_measurement: Units | None,
+        native_value: (
+            None | str | int | float | datetime.date | datetime.datetime | Decimal
+        ),
+        device_class: SensorDeviceClass | None = None,
+        name: str | None = None,
+        device_id: str | None = None,
+    ) -> None:
+        """Update a sensor when the frame is current for that field."""
+        if self._accept_mibeacon_field("sensor", key, device_id):
+            super().update_sensor(
+                key,
+                native_unit_of_measurement,
+                native_value,
+                device_class,
+                name,
+                device_id,
+            )
+
+    def update_binary_sensor(
+        self,
+        key: str,
+        native_value: bool | None,
+        device_class: BinarySensorDeviceClass | None = None,
+        name: str | None = None,
+        device_id: str | None = None,
+    ) -> None:
+        """Update a binary sensor when the frame is current for that field."""
+        if self._accept_mibeacon_field("binary_sensor", key, device_id):
+            super().update_binary_sensor(
+                key, native_value, device_class, name, device_id
+            )
+
+    def fire_event(
+        self,
+        key: str,
+        event_type: str,
+        event_properties: dict[str, str | int | float | None] | None = None,
+        name: str | None = None,
+        device_id: str | None = None,
+    ) -> None:
+        """Fire an event from a regular update."""
+        if self._mibeacon_frame is None or not self._mibeacon_frame.supplemental:
+            super().fire_event(key, event_type, event_properties, name, device_id)
 
     def supported(self, data: BluetoothServiceInfo) -> bool:
         if not super().supported(data):
@@ -2147,7 +2270,7 @@ class XiaomiBluetoothDeviceData(BluetoothData):
 
         for uuid, data in service_info.service_data.items():
             if uuid == SERVICE_MIBEACON:
-                if self._parse_xiaomi(service_info, service_info.name, data):
+                if self._parse_xiaomi(service_info.address, data):
                     self.last_service_info = service_info
             elif uuid == SERVICE_HHCCJCY10:
                 if self._parse_hhcc(service_info, data):
@@ -2187,7 +2310,7 @@ class XiaomiBluetoothDeviceData(BluetoothData):
         return True
 
     def _parse_xiaomi(
-        self, service_info: BluetoothServiceInfo, name: str, data: bytes
+        self, address: str, data: bytes, *, frame: _MiBeaconFrame | None = None
     ) -> bool:
         """Parser for Xiaomi sensors"""
         # check for adstruc length
@@ -2197,8 +2320,14 @@ class XiaomiBluetoothDeviceData(BluetoothData):
             _LOGGER.debug("Invalid data length (initial check), adv: %s", data.hex())
             return False
 
-        mac_readable = service_info.address
-        source_mac = bytes.fromhex(mac_readable.replace(":", ""))
+        try:
+            source_mac = bytes.fromhex(address.replace(":", ""))
+        except ValueError:
+            if frame is not None:
+                return False
+            raise
+        if frame is not None and len(source_mac) != 6:
+            return False
 
         # extract frame control bits
         frctrl = data[0] + (data[1] << 8)
@@ -2267,11 +2396,11 @@ class XiaomiBluetoothDeviceData(BluetoothData):
 
         device_type = device.model
 
-        self.device_id = device_id
-        self.device_type = device_type
-
-        # set to True if the device is not sending regular BLE advertisements
-        self.sleepy_device = device_type in SLEEPY_DEVICE_MODELS
+        if frame is None:
+            self.device_id = device_id
+            self.device_type = device_type
+            # set to True if the device is not sending regular BLE advertisements
+            self.sleepy_device = device_type in SLEEPY_DEVICE_MODELS
 
         packet_id = data[4]
 
@@ -2314,11 +2443,19 @@ class XiaomiBluetoothDeviceData(BluetoothData):
                 capability_io = data[i - 1]
                 sinfo += ", IO: " + hex(capability_io)
 
-        identifier = short_address(service_info.address)
-        self.set_title(f"{device.name} {identifier} ({device.model})")
-        self.set_device_name(f"{device.name} {identifier}")
-        self.set_device_type(device.model)
-        self.set_device_manufacturer(device.manufacturer)
+        if frame is not None:
+            payload = self._decrypt_mibeacon_v4_v5(
+                data, i, xiaomi_mac, supplemental=True
+            )
+            if payload is None:
+                return False
+            self._apply_mibeacon_objects(payload, data, device_type, sinfo, frame)
+            if frame.fields and not frame.seed and self.title is None:
+                self._set_mibeacon_device_info(address, device)
+                self.set_device_sw_version("Xiaomi (MiBeacon V5 encrypted)")
+            return True
+
+        self._set_mibeacon_device_info(address, device)
 
         # check that data contains object
         if frctrl_object_include == 0:
@@ -2361,68 +2498,102 @@ class XiaomiBluetoothDeviceData(BluetoothData):
         self.set_device_sw_version(firmware)
 
         if payload is not None:
-            sinfo += ", Object data: " + payload.hex()
-            # loop through parse_xiaomi payload
-            payload_start = 0
-            payload_length = len(payload)
-            # assume that the data may have several values of different types
-            while payload_length >= payload_start + 3:
-                obj_typecode = payload[payload_start] + (
-                    payload[payload_start + 1] << 8
-                )
-                obj_length = payload[payload_start + 2]
-                next_start = payload_start + 3 + obj_length
-                if payload_length < next_start:
-                    # The payload segments are corrupted - if this is legacy encryption
-                    # then the key is probably just wrong
-                    # V4/V5 encryption has an authentication tag, so we don't apply the
-                    # same restriction there.
-                    if self.encryption_scheme == EncryptionScheme.MIBEACON_LEGACY:
-                        if self.decryption_failed is True:
-                            # we only ask for reautentification
-                            # till the decryption has failed twice.
-                            self.bindkey_verified = False
-                        else:
-                            self.decryption_failed = True
-                    _LOGGER.debug(
-                        "Invalid payload data length, payload: %s", payload.hex()
-                    )
-                    break
-                this_start = payload_start + 3
-                dobject = payload[this_start:next_start]
-                if (
-                    dobject
-                    and obj_length != 0
-                    or hex(obj_typecode) in OBJECTS_DEVICE_TYPE
-                ):
-                    resfunc = xiaomi_dataobject_dict.get(obj_typecode, None)
-                    if resfunc:
-                        try:
-                            self.unhandled.update(resfunc(dobject, self, device_type))
-                        except (IndexError, struct.error, ValueError) as err:
-                            # A single malformed or truncated object must not
-                            # abort parsing of the whole packet. This happens
-                            # with corrupted frames or adverts from non-Xiaomi
-                            # devices that reuse a registered product_id and
-                            # carry an object whose declared length does not
-                            # match what the decoder expects. Skip it and let
-                            # any remaining objects in the payload parse.
-                            _LOGGER.debug(
-                                "%s, skipping malformed object 0x%x (data %s): %s",
-                                sinfo,
-                                obj_typecode,
-                                dobject.hex(),
-                                err,
-                            )
-                    else:
-                        _LOGGER.info(
-                            "%s, UNKNOWN dataobject in payload! Adv: %s",
-                            sinfo,
-                            data.hex(),
-                        )
-                payload_start = next_start
+            if (
+                self.mibeacon_order is not None
+                and (counter := standard_mibeacon_frame_counter(data)) is not None
+            ):
+                frame = _MiBeaconFrame(counter)
+            self._apply_mibeacon_objects(payload, data, device_type, sinfo, frame)
 
         return True
+
+    def _set_mibeacon_device_info(self, address: str, device: DeviceEntry) -> None:
+        """Set the device identity for a MiBeacon update."""
+        identifier = short_address(address)
+        self.set_title(f"{device.name} {identifier} ({device.model})")
+        self.set_device_name(f"{device.name} {identifier}")
+        self.set_device_type(device.model)
+        self.set_device_manufacturer(device.manufacturer)
+
+    def _apply_mibeacon_objects(
+        self,
+        payload: bytes,
+        data: bytes,
+        device_type: str,
+        sinfo: str,
+        frame: _MiBeaconFrame | None,
+    ) -> None:
+        """Apply objects with this frame's ordering rules."""
+        self._mibeacon_frame = frame
+        try:
+            self._parse_mibeacon_objects(payload, data, device_type, sinfo)
+        finally:
+            self._mibeacon_frame = None
+
+    def _parse_mibeacon_objects(
+        self, payload: bytes, data: bytes, device_type: str, sinfo: str
+    ) -> None:
+        """Dispatch the objects in a decoded MiBeacon payload."""
+        supplemental = (
+            self._mibeacon_frame is not None and self._mibeacon_frame.supplemental
+        )
+        sinfo += ", Object data: " + payload.hex()
+        # loop through parse_xiaomi payload
+        payload_start = 0
+        payload_length = len(payload)
+        # assume that the data may have several values of different types
+        while payload_length >= payload_start + 3:
+            obj_typecode = payload[payload_start] + (payload[payload_start + 1] << 8)
+            obj_length = payload[payload_start + 2]
+            next_start = payload_start + 3 + obj_length
+            if payload_length < next_start:
+                # The payload segments are corrupted - if this is legacy encryption
+                # then the key is probably just wrong
+                # V4/V5 encryption has an authentication tag, so we don't apply the
+                # same restriction there.
+                if (
+                    not supplemental
+                    and self.encryption_scheme == EncryptionScheme.MIBEACON_LEGACY
+                ):
+                    if self.decryption_failed is True:
+                        # we only ask for reautentification
+                        # till the decryption has failed twice.
+                        self.bindkey_verified = False
+                    else:
+                        self.decryption_failed = True
+                _LOGGER.debug("Invalid payload data length, payload: %s", payload.hex())
+                break
+            this_start = payload_start + 3
+            dobject = payload[this_start:next_start]
+            if dobject and obj_length != 0 or hex(obj_typecode) in OBJECTS_DEVICE_TYPE:
+                resfunc = xiaomi_dataobject_dict.get(obj_typecode, None)
+                if resfunc:
+                    try:
+                        values = resfunc(dobject, self, device_type)
+                        if not supplemental:
+                            self.unhandled.update(values)
+                    except (IndexError, struct.error, ValueError) as err:
+                        # A single malformed or truncated object must not
+                        # abort parsing of the whole packet. This happens
+                        # with corrupted frames or adverts from non-Xiaomi
+                        # devices that reuse a registered product_id and
+                        # carry an object whose declared length does not
+                        # match what the decoder expects. Skip it and let
+                        # any remaining objects in the payload parse.
+                        _LOGGER.debug(
+                            "%s, skipping malformed object 0x%x (data %s): %s",
+                            sinfo,
+                            obj_typecode,
+                            dobject.hex(),
+                            err,
+                        )
+                else:
+                    _LOGGER.info(
+                        "%s, UNKNOWN dataobject in payload! Adv: %s",
+                        sinfo,
+                        data.hex(),
+                    )
+            payload_start = next_start
 
     def _parse_scale_v1(self, service_info: BluetoothServiceInfo, data: bytes) -> bool:
         if len(data) != 10:
@@ -2572,7 +2743,7 @@ class XiaomiBluetoothDeviceData(BluetoothData):
         return True
 
     def _decrypt_mibeacon_v4_v5(
-        self, data: bytes, i: int, xiaomi_mac: bytes
+        self, data: bytes, i: int, xiaomi_mac: bytes, *, supplemental: bool = False
     ) -> bytes | None:
         """decrypt MiBeacon v4/v5 encrypted advertisements"""
         # check for minimum length of encrypted advertisement
@@ -2580,28 +2751,27 @@ class XiaomiBluetoothDeviceData(BluetoothData):
             _LOGGER.debug("Invalid data length (for decryption), adv: %s", data.hex())
             return None
 
-        if not self.bindkey:
-            self.bindkey_verified = False
-            _LOGGER.debug("Encryption key not set and adv is encrypted")
+        if self.cipher is None:
+            if not supplemental:
+                self.bindkey_verified = False
+                if not self.bindkey:
+                    _LOGGER.debug("Encryption key not set and adv is encrypted")
+                else:
+                    _LOGGER.error(
+                        "Encryption key should be 16 bytes (32 characters) long"
+                    )
             return None
 
-        if not self.bindkey or len(self.bindkey) != 16:
-            self.bindkey_verified = False
-            _LOGGER.error("Encryption key should be 16 bytes (32 characters) long")
-            return None
+        nonce = xiaomi_mac[::-1] + data[2:5] + data[-7:-4]
+        encrypted_payload, mic = data[i:-7], data[-4:]
 
-        nonce = b"".join([xiaomi_mac[::-1], data[2:5], data[-7:-4]])
-        associated_data = b"\x11"
-        mic = data[-4:]
-        encrypted_payload = data[i:-7]
-
-        assert self.cipher is not None  # nosec
-        # decrypt the data
         try:
             decrypted_payload = self.cipher.decrypt(
-                nonce, encrypted_payload + mic, associated_data
+                nonce, encrypted_payload + mic, b"\x11"
             )
         except InvalidTag as error:
+            if supplemental:
+                return None
             if self.decryption_failed is True:
                 # we only ask for reautentification till
                 # the decryption has failed twice.
@@ -2613,6 +2783,8 @@ class XiaomiBluetoothDeviceData(BluetoothData):
             _LOGGER.debug("nonce: %s", nonce.hex())
             _LOGGER.debug("encrypted payload: %s", encrypted_payload.hex())
             return None
+        if supplemental:
+            return decrypted_payload
         if decrypted_payload is None:
             self.bindkey_verified = False
             _LOGGER.error(
